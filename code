@@ -1,0 +1,438 @@
+# Clinical Trial Data Programming: From SDTM to ADaM in R
+# Author: Reshika Rimal
+#
+# Educational example using base R and pharmaversesdtm.
+# Partial dates are not imputed.
+# The onset rule does not assess worsening of existing events.
+
+# 1. Setup ---------------------------------------------------------------
+
+# Install once in the Console if needed:
+# install.packages("pharmaversesdtm")
+
+if (!requireNamespace("pharmaversesdtm", quietly = TRUE)) {
+  stop("Install pharmaversesdtm before running this script.")
+}
+
+end_window <- 30L
+output_dir <- "outputs"
+
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# 2. Helper functions ----------------------------------------------------
+
+# Convert complete calendar dates only.
+# Reject invalid complete dates; leave partial dates missing.
+parse_complete_date <- function(x) {
+  result <- rep(as.Date(NA_character_), length(x))
+  complete <- !is.na(x) & grepl("^\\d{4}-\\d{2}-\\d{2}$", x)
+
+  result[complete] <- as.Date(x[complete], format = "%Y-%m-%d")
+
+  if (anyNA(result[complete]) ||
+      any(format(result[complete], "%Y-%m-%d") != x[complete])) {
+    stop("An invalid complete calendar date was found.")
+  }
+
+  result
+}
+
+# Calculate study days without a Day 0.
+relative_day <- function(date, reference) {
+  difference <- as.integer(date - reference)
+  ifelse(difference >= 0, difference + 1L, difference)
+}
+
+# Require nonmissing, nonblank, unique record keys.
+check_keys <- function(data, keys) {
+  stopifnot(
+    !anyNA(data[keys]),
+    !anyDuplicated(data[keys])
+  )
+
+  for (key in keys) {
+    stopifnot(all(nzchar(trimws(as.character(data[[key]])))))
+  }
+}
+
+# Confirm every study/participant pair exists in DM.
+check_subject_matches <- function(data, dm) {
+  pairs <- unique(data[c("STUDYID", "USUBJID")])
+
+  matched <- merge(
+    pairs,
+    dm[c("STUDYID", "USUBJID")],
+    by = c("STUDYID", "USUBJID")
+  )
+
+  stopifnot(nrow(matched) == nrow(pairs))
+}
+
+# 3. Load and check source data -------------------------------------------
+
+dm <- pharmaversesdtm::dm
+ex <- pharmaversesdtm::ex
+ae <- pharmaversesdtm::ae
+
+check_keys(dm, c("STUDYID", "USUBJID"))
+check_keys(ex, c("STUDYID", "USUBJID", "EXSEQ"))
+check_keys(ae, c("STUDYID", "USUBJID", "AESEQ"))
+
+check_subject_matches(ex, dm)
+check_subject_matches(ae, dm)
+
+input_summary <- data.frame(
+  Dataset = c("DM", "EX", "AE"),
+  Records = c(nrow(dm), nrow(ex), nrow(ae)),
+  Variables = c(ncol(dm), ncol(ex), ncol(ae)),
+  Participants = c(
+    length(unique(dm$USUBJID)),
+    length(unique(ex$USUBJID)),
+    length(unique(ae$USUBJID))
+  )
+)
+
+# 4. Build ADSL ----------------------------------------------------------
+
+adsl <- dm[c(
+  "STUDYID", "USUBJID", "SUBJID", "SITEID",
+  "AGE", "AGEU", "SEX", "RACE", "ETHNIC", "COUNTRY",
+  "ARM", "ACTARM"
+)]
+
+adsl$TRT01P <- adsl$ARM
+adsl$TRT01A <- adsl$ACTARM
+
+# Project exposure rule:
+# retain positive doses and placebo records with a recorded dose.
+qualifies <- !is.na(ex$EXDOSE) &
+  (ex$EXDOSE > 0 | ex$EXTRT %in% "PLACEBO")
+
+valid_ex <- ex[qualifies, ]
+
+valid_ex$EXSTDT <- parse_complete_date(valid_ex$EXSTDTC)
+valid_ex$EXENDT <- parse_complete_date(valid_ex$EXENDTC)
+
+# Current workflow requires complete exposure starts.
+stopifnot(!anyNA(valid_ex$EXSTDT))
+
+# Exposure ends must be either missing or complete dates.
+end_missing <- is.na(valid_ex$EXENDTC) |
+  trimws(valid_ex$EXENDTC) == ""
+
+stopifnot(all(end_missing | !is.na(valid_ex$EXENDT)))
+
+stopifnot(all(
+  is.na(valid_ex$EXENDT) |
+    valid_ex$EXENDT >= valid_ex$EXSTDT
+))
+
+adsl$TRTSDT <- rep(as.Date(NA_character_), nrow(adsl))
+adsl$TRTEDT <- rep(as.Date(NA_character_), nrow(adsl))
+adsl$SAFFL <- "N"
+
+for (i in seq_len(nrow(adsl))) {
+  subject_ex <- valid_ex[
+    valid_ex$STUDYID == adsl$STUDYID[i] &
+      valid_ex$USUBJID == adsl$USUBJID[i],
+  ]
+
+  if (nrow(subject_ex) == 0L) next
+
+  adsl$SAFFL[i] <- "Y"
+  adsl$TRTSDT[i] <- min(subject_ex$EXSTDT)
+
+  # Preserve uncertainty when any qualifying end date is unknown.
+  if (!anyNA(subject_ex$EXENDT)) {
+    adsl$TRTEDT[i] <- max(subject_ex$EXENDT)
+  }
+}
+
+check_keys(adsl, c("STUDYID", "USUBJID"))
+
+stopifnot(
+  nrow(adsl) == nrow(dm),
+  all(!is.na(adsl$TRTSDT[adsl$SAFFL == "Y"])),
+  all(
+    is.na(adsl$TRTEDT) |
+      adsl$TRTEDT >= adsl$TRTSDT
+  )
+)
+
+# 5. Build preliminary ADAE -----------------------------------------------
+
+adsl_variables <- c(
+  "STUDYID", "USUBJID", "TRT01P", "TRT01A",
+  "TRTSDT", "TRTEDT", "SAFFL"
+)
+
+adae <- merge(
+  ae,
+  adsl[adsl_variables],
+  by = c("STUDYID", "USUBJID"),
+  all.x = TRUE,
+  sort = FALSE
+)
+
+stopifnot(
+  nrow(adae) == nrow(ae),
+  !anyNA(adae$SAFFL)
+)
+
+adae$ASTDT <- parse_complete_date(adae$AESTDTC)
+adae$AENDT <- parse_complete_date(adae$AEENDTC)
+
+# This version supports complete or missing AE end dates.
+end_missing <- is.na(adae$AEENDTC) | trimws(adae$AEENDTC) == ""
+stopifnot(all(end_missing | !is.na(adae$AENDT)))
+
+adae$START_REVIEW <- ifelse(is.na(adae$ASTDT), "Y", "N")
+
+adae$ASTDY <- relative_day(adae$ASTDT, adae$TRTSDT)
+adae$AENDY <- relative_day(adae$AENDT, adae$TRTSDT)
+
+both_dates <- !is.na(adae$ASTDT) & !is.na(adae$AENDT)
+
+stopifnot(all(
+  adae$AENDT[both_dates] >= adae$ASTDT[both_dates]
+))
+
+# Inclusive calendar-day duration.
+adae$ADURN <- as.integer(adae$AENDT - adae$ASTDT) + 1L
+adae$ADURU <- "DAYS"
+
+stopifnot(
+  !any(adae$ASTDY == 0, na.rm = TRUE),
+  !any(adae$AENDY == 0, na.rm = TRUE)
+)
+
+# 6. Create possible start-date bounds ------------------------------------
+#
+# START_LO and START_HI are project-specific review variables.
+# They do not replace ASTDT or represent exact-date imputation.
+
+adae$START_LO <- adae$ASTDT
+adae$START_HI <- adae$ASTDT
+
+year_only <- which(
+  !is.na(adae$AESTDTC) &
+    grepl("^\\d{4}$", adae$AESTDTC)
+)
+
+month_only <- which(
+  !is.na(adae$AESTDTC) &
+    grepl("^\\d{4}-\\d{2}$", adae$AESTDTC)
+)
+
+if (length(year_only) > 0L) {
+  adae$START_LO[year_only] <- as.Date(
+    paste0(adae$AESTDTC[year_only], "-01-01")
+  )
+
+  adae$START_HI[year_only] <- as.Date(
+    paste0(adae$AESTDTC[year_only], "-12-31")
+  )
+}
+
+for (i in month_only) {
+  first_day <- as.Date(paste0(adae$AESTDTC[i], "-01"))
+  next_month <- seq(first_day, by = "month", length.out = 2)[2]
+
+  adae$START_LO[i] <- first_day
+  adae$START_HI[i] <- next_month - 1
+}
+
+# An event cannot begin after its known end.
+has_end <- which(
+  !is.na(adae$START_HI) & !is.na(adae$AENDT)
+)
+
+adae$START_HI[has_end] <- pmin(
+  adae$START_HI[has_end],
+  adae$AENDT[has_end]
+)
+
+has_bounds <- !is.na(adae$START_LO) & !is.na(adae$START_HI)
+
+stopifnot(all(
+  adae$START_LO[has_bounds] <= adae$START_HI[has_bounds]
+))
+
+# 7. Apply the project-defined onset rule ---------------------------------
+#
+# Qualifying interval: first treatment through last treatment + 30 days.
+# An event is classified only when its possible start dates agree.
+# Missing treatment end dates may leave events unresolved.
+
+adae$TE_STATUS <- "REVIEW"
+adae$TE_STATUS[adae$SAFFL == "N"] <- "NOT ELIGIBLE"
+
+for (i in which(adae$SAFFL == "Y")) {
+  lower <- adae$START_LO[i]
+  upper <- adae$START_HI[i]
+  treatment_start <- adae$TRTSDT[i]
+  treatment_end <- adae$TRTEDT[i]
+
+  if (is.na(lower) || is.na(upper) || is.na(treatment_start)) {
+    next
+  }
+
+  if (upper < treatment_start) {
+    adae$TE_STATUS[i] <- "NO"
+    next
+  }
+
+  if (is.na(treatment_end)) next
+
+  cutoff <- treatment_end + end_window
+
+  if (lower > cutoff) {
+    adae$TE_STATUS[i] <- "NO"
+  } else if (lower >= treatment_start && upper <= cutoff) {
+    adae$TE_STATUS[i] <- "YES"
+  }
+}
+
+# Missing flags include both NO and REVIEW; consult TE_STATUS.
+adae$TRTEMFL <- ifelse(
+  adae$TE_STATUS == "YES", "Y", NA_character_
+)
+
+# 8. Assign analysis sequence numbers ------------------------------------
+
+adae <- adae[order(
+  adae$STUDYID,
+  adae$USUBJID,
+  adae$ASTDT,
+  adae$AESEQ,
+  na.last = TRUE
+), ]
+
+row.names(adae) <- NULL
+
+subject_group <- interaction(
+  adae$STUDYID,
+  adae$USUBJID,
+  drop = TRUE
+)
+
+adae$ASEQ <- as.integer(
+  ave(seq_len(nrow(adae)), subject_group, FUN = seq_along)
+)
+
+check_keys(adae, c("STUDYID", "USUBJID", "AESEQ"))
+check_keys(adae, c("STUDYID", "USUBJID", "ASEQ"))
+
+# 9. Summarize participants -----------------------------------------------
+
+subjects <- adsl[
+  adsl$SAFFL == "Y",
+  c("STUDYID", "USUBJID", "TRT01A")
+]
+
+subjects$STATUS <- vapply(
+  seq_len(nrow(subjects)),
+  function(i) {
+    event_status <- adae$TE_STATUS[
+      adae$STUDYID == subjects$STUDYID[i] &
+        adae$USUBJID == subjects$USUBJID[i]
+    ]
+
+    if ("YES" %in% event_status) {
+      "At least one qualifying event"
+    } else if ("REVIEW" %in% event_status) {
+      "Unresolved"
+    } else {
+      "No qualifying event recorded"
+    }
+  },
+  character(1)
+)
+
+subjects$STATUS <- factor(
+  subjects$STATUS,
+  levels = c(
+    "At least one qualifying event",
+    "Unresolved",
+    "No qualifying event recorded"
+  )
+)
+
+counts <- with(subjects, table(TRT01A, STATUS))
+percentages <- round(prop.table(counts, margin = 1) * 100, 1)
+
+stopifnot(sum(counts) == nrow(subjects))
+
+# Combine counts and percentages in one export.
+participant_summary <- as.data.frame(
+  counts,
+  responseName = "Participants"
+)
+
+participant_summary$Percent <- as.vector(percentages)
+
+event_counts <- with(
+  adae,
+  table(
+    TRT01A,
+    TE_STATUS = factor(
+      TE_STATUS,
+      levels = c("YES", "NO", "REVIEW", "NOT ELIGIBLE")
+    )
+  )
+)
+
+stopifnot(sum(event_counts) == nrow(adae))
+
+# 10. Save completed working outputs -------------------------------------
+
+saveRDS(adsl, file.path(output_dir, "adsl.rds"))
+saveRDS(adae, file.path(output_dir, "adae_preliminary.rds"))
+
+write.csv(
+  input_summary,
+  file.path(output_dir, "input_data_summary.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  adae[adae$TE_STATUS == "REVIEW", ],
+  file.path(output_dir, "ae_review_records.csv"),
+  row.names = FALSE,
+  na = ""
+)
+
+write.csv(
+  subjects,
+  file.path(output_dir, "participant_safety_status.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  participant_summary,
+  file.path(output_dir, "participant_safety_summary.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  as.data.frame(event_counts),
+  file.path(output_dir, "event_safety_summary.csv"),
+  row.names = FALSE
+)
+
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(output_dir, "session_info.txt")
+)
+
+# 11. Display results ----------------------------------------------------
+
+print(input_summary)
+print(event_counts)
+print(counts)
+print(percentages)
+
+message(
+  "Workflow completed. Outputs saved to: ",
+  normalizePath(output_dir)
+)
